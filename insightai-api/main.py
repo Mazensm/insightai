@@ -1,77 +1,40 @@
-import os
-import io
-from typing import Optional
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI
 from pydantic import BaseModel
-import fitz  # PyMuPDF
-from pdfminer.high_level import extract_text
-import httpx
-from dotenv import load_dotenv
+from openai import OpenAI
+import os
 
-load_dotenv()
+app = FastAPI()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="InsightAI")
-
-class SummaryRequest(BaseModel):
+class SummarizeInput(BaseModel):
     text: str
-    topic: Optional[str] = "general"
-    model: Optional[str] = "gpt-4o-mini"
+    topics: list[str] | None = None
 
-@app.get('/')
-def root():
-    return {"ok": True, "name": "InsightAI API"}
-
-@app.post('/extract')
-async def extract(file: UploadFile = File(...)):
-    content = await file.read()
-    text = ""
-    if file.filename.lower().endswith('.pdf'):
-        try:
-            text = extract_text(io.BytesIO(content))
-        except Exception:
-            # fallback with PyMuPDF
-            doc = fitz.open(stream=content, filetype='pdf')
-            text = "\n".join([page.get_text() for page in doc])
-    else:
-        text = content.decode('utf-8', errors='ignore')
-    return {"chars": len(text), "text": text[:2000]}
-
-SYSTEM_PROMPT = "You are a precise analyst. Given TEXT: \n- Produce JSON with keys: executive_summary[], insights[], decisions[], actions[{title,owner,due}], risks[].\n- Keep items concise and specific."
-
-async def call_openai(prompt: str, model: str):
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        # dry-run stub
-        return {
-            "executive_summary": ["(stub) Provide API key to enable real LLM."],
-            "insights": ["Example insight"],
-            "decisions": [],
-            "actions": [{"title":"Follow up","owner":"You","due":"Next week"}],
-            "risks": ["Data missing"]
-        }
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    payload = {
-        "model": model,
-        "messages": [
-            {"role":"system","content": SYSTEM_PROMPT},
-            {"role":"user","content": prompt}
+@app.post("/summarize")
+def summarize(body: SummarizeInput):
+    topics = body.topics or ["key insights", "risks", "next actions"]
+    system = (
+        "You are an analyst. Return a concise JSON with fields: "
+        "`insights` (bulleted strings), `actions` (numbered steps), "
+        "`topics` (dict of topic->summary). Be specific and non-generic."
+    )
+    prompt = (
+        f"Summarize the following content.\n\nTopics to cover: {topics}\n\n"
+        f"CONTENT:\n{body.text}\n"
+    )
+    resp = client.responses.create(
+        model="gpt-4o-mini",
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt}
         ],
-        "temperature": 0.2
-    }
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        text = data["choices"][0]["message"]["content"]
-        import json as _json
-        try:
-            return _json.loads(text)
-        except Exception:
-            return {"raw": text}
+        temperature=0.2,
+    )
 
-@app.post('/summarize')
-async def summarize(req: SummaryRequest):
-    prompt = f"Analyze the following text and return structured JSON:\n---\n{req.text[:12000]}\n---\nTopic: {req.topic}\n"
-    result = await call_openai(prompt, req.model or "gpt-4o-mini")
-    return result
+    content = "".join(
+        block.text.value
+        for out in resp.output
+        for block in getattr(out, "content", [])
+        if getattr(block, "type", "") == "output_text"
+    )
+    return {"summary": content}
